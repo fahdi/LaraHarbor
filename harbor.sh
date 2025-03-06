@@ -1,4 +1,3 @@
-
 #!/bin/bash
 
 # LaraHarbor: Laravel Multi-Site Setup System
@@ -464,13 +463,17 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     nginx \
-    supervisor
+    supervisor \
+    netcat-openbsd
 
 # Clear cache
 RUN apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Install PHP extensions
 RUN docker-php-ext-install pdo pdo_mysql mbstring exif pcntl bcmath gd zip
+
+# Install Redis extension
+RUN pecl install redis && docker-php-ext-enable redis
 
 # Get latest Composer
 COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
@@ -582,9 +585,31 @@ if [ ! -f "/var/www/html/.env" ]; then
     php artisan key:generate
 fi
 
+# Make sure Redis extension is available if needed
+if grep -q "REDIS_HOST" /var/www/html/.env; then
+    if ! php -m | grep -q "redis"; then
+        echo "Installing Redis extension..."
+        pecl install redis && docker-php-ext-enable redis
+    fi
+fi
+
+# Wait for database to be ready
+echo "Waiting for database to be ready..."
+until nc -z -v -w30 $(grep DB_HOST /var/www/html/.env | cut -d '=' -f2) 3306
+do
+  echo "Waiting for database connection..."
+  sleep 5
+done
+
 # Apply database migrations
 echo "Running database migrations..."
 php artisan migrate --force
+
+# Clear caches
+php artisan config:clear
+php artisan cache:clear
+php artisan view:clear
+php artisan route:clear
 
 # Set proper permissions
 chown -R www-data:www-data /var/www/html/storage
@@ -661,6 +686,11 @@ EOF
     echo "Setting up new Laravel project..."
     docker run --rm -v "$SITE_DIR/src:/app" composer create-project laravel/laravel /app
     
+    # Install predis if Redis is selected
+    if [[ "$REDIS_CHOICE" == "y" ]]; then
+      docker run --rm -v "$SITE_DIR/src:/app" -w /app composer require predis/predis
+    fi
+    
     # Configure environment for Laravel
     cat > $SITE_DIR/src/.env << EOF
 APP_NAME=${SITE_NAME}
@@ -681,15 +711,15 @@ DB_USERNAME=laravel
 DB_PASSWORD=${DB_PASSWORD}
 
 BROADCAST_DRIVER=log
-CACHE_DRIVER=${REDIS_CHOICE == "y" ? "redis" : "file"}
+CACHE_DRIVER=$([ "$REDIS_CHOICE" == "y" ] && echo "redis" || echo "file")
 FILESYSTEM_DISK=local
-QUEUE_CONNECTION=${REDIS_CHOICE == "y" ? "redis" : "sync"}
-SESSION_DRIVER=${REDIS_CHOICE == "y" ? "redis" : "file"}
+QUEUE_CONNECTION=$([ "$REDIS_CHOICE" == "y" ] && echo "redis" || echo "sync")
+SESSION_DRIVER=$([ "$REDIS_CHOICE" == "y" ] && echo "redis" || echo "file")
 SESSION_LIFETIME=120
 
-${REDIS_CHOICE == "y" ? "REDIS_HOST=${SITE_NAME}-redis" : ""}
-${REDIS_CHOICE == "y" ? "REDIS_PASSWORD=${REDIS_PASSWORD}" : ""}
-${REDIS_CHOICE == "y" ? "REDIS_PORT=6379" : ""}
+$([ "$REDIS_CHOICE" == "y" ] && echo "REDIS_HOST=${SITE_NAME}-redis")
+$([ "$REDIS_CHOICE" == "y" ] && echo "REDIS_PASSWORD=${REDIS_PASSWORD}")
+$([ "$REDIS_CHOICE" == "y" ] && echo "REDIS_PORT=6379")
 
 MAIL_MAILER=smtp
 MAIL_HOST=laraharbor-mailhog
@@ -700,6 +730,10 @@ MAIL_ENCRYPTION=null
 MAIL_FROM_ADDRESS="hello@${SITE_DOMAIN}"
 MAIL_FROM_NAME="${SITE_NAME}"
 EOF
+
+    # Set proper permissions
+    chmod -R 777 $SITE_DIR/src/storage
+    chmod -R 777 $SITE_DIR/src/bootstrap/cache
   else
     # Set up for existing project (user will need to import code)
     mkdir -p $SITE_DIR/src
@@ -734,6 +768,29 @@ EOF
   # Start containers
   docker compose up -d
   
+  echo "Starting ${SITE_NAME} site..."
+  echo "This may take a moment while containers initialize..."
+  
+  # Wait for services to be ready
+  for i in {1..30}; do
+    echo -n "."
+    
+    # Check if site is up
+    RESPONSE=$(curl -s -k -o /dev/null -w "%{http_code}" https://${SITE_DOMAIN}/)
+    if [ "$RESPONSE" == "200" ]; then
+      echo " Ready!"
+      break
+    fi
+    
+    if [ $i -eq 30 ]; then
+      echo ""
+      echo "⚠️ Site initialization is taking longer than expected. The site should become available shortly."
+      echo "You can check the logs with 'cd ${SITE_DIR} && docker compose logs -f'"
+    fi
+    
+    sleep 2
+  done
+  
   echo "✅ LaraHarbor site created successfully!"
   echo "🌐 Site URL: https://${SITE_DOMAIN}"
   echo "🛠 Database Admin: https://admin.${SITE_DOMAIN}"
@@ -750,6 +807,23 @@ EOF
   echo ""
   echo "⚠️ Since this uses self-signed certificates, you'll need to accept the security warning in your browser."
   echo "📧 All emails sent from Laravel will be captured by MailHog and available at https://mail.local"
+  
+  # Make sure everything is initialized properly before returning
+  cd $SITE_DIR/src
+  
+  # Install predis if Redis is enabled
+  if [[ "$REDIS_CHOICE" == "y" ]]; then
+    docker exec ${SITE_NAME}-app composer require predis/predis --no-interaction
+  fi
+  
+  # Generate application key if not already set
+  APP_KEY=$(docker exec ${SITE_NAME}-app grep "APP_KEY=" .env | cut -d '=' -f2)
+  if [[ -z "$APP_KEY" || "$APP_KEY" == "" ]]; then
+    docker exec ${SITE_NAME}-app php artisan key:generate
+  fi
+  
+  echo ""
+  echo "Your site should now be ready to serve at https://${SITE_DOMAIN}"
 }
 
 # ----- Manual Database Backup -----
@@ -840,3 +914,162 @@ list_sites() {
 
       # Check if backups exist
       backup_count=$(find ~/LaraHarbor/backups/${site_name} -name "*.sql" 2>/dev/null | wc -l)
+      
+      # Print site information
+      echo "- ${site_name}"
+      echo "  URL: https://${site_domain}"
+      echo "  Status: ${status}"
+      echo "  Admin: https://admin.${site_domain}"
+      echo "  Backups: ${backup_count} available"
+      echo ""
+      
+      ((site_count++))
+    fi
+  done
+  
+  if [ $site_count -eq 0 ]; then
+    echo "No sites found. Create a new site with: harbor create"
+  else
+    echo "${site_count} site(s) found."
+  fi
+}
+
+# ----- Start All Sites -----
+start_all_sites() {
+  echo "Starting all LaraHarbor sites..."
+  
+  # First, make sure the proxy is running
+  cd ~/LaraHarbor/proxy
+  docker compose up -d
+  
+  # Then start mailhog
+  cd ~/LaraHarbor/mailhog
+  docker compose up -d
+  
+  # Then start all sites
+  for site in ~/LaraHarbor/*/docker-compose.yml; do
+    if [ "$site" != "~/LaraHarbor/*/docker-compose.yml" ] && \
+       [ "$site" != "~/LaraHarbor/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/LaraHarbor/mailhog/docker-compose.yml" ] && \
+       [ "$site" != "~/LaraHarbor/backups/docker-compose.yml" ]; then
+      site_dir=$(dirname "$site")
+      site_name=$(basename "$site_dir")
+      
+      echo "Starting ${site_name}..."
+      cd "$site_dir"
+      docker compose up -d
+    fi
+  done
+  
+  echo "✅ All sites started!"
+}
+
+# ----- Stop All Sites -----
+stop_all_sites() {
+  echo "Stopping all LaraHarbor sites..."
+  
+  # Stop all sites first
+  for site in ~/LaraHarbor/*/docker-compose.yml; do
+    if [ "$site" != "~/LaraHarbor/*/docker-compose.yml" ] && \
+       [ "$site" != "~/LaraHarbor/proxy/docker-compose.yml" ] && \
+       [ "$site" != "~/LaraHarbor/mailhog/docker-compose.yml" ] && \
+       [ "$site" != "~/LaraHarbor/backups/docker-compose.yml" ]; then
+      site_dir=$(dirname "$site")
+      site_name=$(basename "$site_dir")
+      
+      echo "Stopping ${site_name}..."
+      cd "$site_dir"
+      docker compose down
+    fi
+  done
+  
+  # Then stop mailhog
+  cd ~/LaraHarbor/mailhog
+  docker compose down
+  
+  # Then stop proxy
+  cd ~/LaraHarbor/proxy
+  docker compose down
+  
+  echo "✅ All sites stopped!"
+}
+
+# ----- Delete Site -----
+delete_site() {
+  read -p "Enter site name to delete: " SITE_NAME
+  SITE_DIR=~/LaraHarbor/${SITE_NAME}
+  
+  if [ ! -d "$SITE_DIR" ]; then
+    echo "❌ Site not found: $SITE_NAME"
+    return
+  fi
+  
+  # Confirm deletion
+  read -p "⚠️ Are you sure you want to delete ${SITE_NAME}? This action cannot be undone! (y/n): " CONFIRM
+  if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    echo "Deletion cancelled."
+    return
+  fi
+  
+  # Stop containers if running
+  cd "$SITE_DIR"
+  docker compose down
+  
+  # Create a final backup
+  echo "Creating final backup before deletion..."
+  backup_site
+  
+  # Remove the site directory
+  cd ~/LaraHarbor
+  rm -rf "$SITE_DIR"
+  
+  # Remove from hosts file
+  SITE_DOMAIN="${SITE_NAME}.local"
+  sudo sed -i '' "/\s${SITE_DOMAIN}/d" /etc/hosts
+  
+  echo "✅ Site ${SITE_NAME} has been deleted."
+  echo "💾 A final backup was saved to ~/LaraHarbor/backups/${SITE_NAME}/"
+}
+
+# ----- Main Script -----
+# Parse command-line arguments
+case "$1" in
+  setup)
+    setup_system
+    ;;
+  create)
+    create_site
+    ;;
+  backup)
+    backup_site
+    ;;
+  list)
+    list_sites
+    ;;
+  start-all)
+    start_all_sites
+    ;;
+  stop-all)
+    stop_all_sites
+    ;;
+  delete)
+    delete_site
+    ;;
+  *)
+    echo "LaraHarbor: Laravel Multi-Site Management"
+    echo "usage: $0 <command>"
+    echo ""
+    echo "Available commands:"
+    echo "  setup        Initial setup of LaraHarbor system (run once)"
+    echo "  create       Create a new Laravel site"
+    echo "  backup       Manually backup a site's database"
+    echo "  list         List all sites and their status"
+    echo "  start-all    Start all sites"
+    echo "  stop-all     Stop all sites"
+    echo "  delete       Delete a site"
+    echo ""
+    exit 1
+    ;;
+esac
+
+exit 0
